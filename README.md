@@ -7,9 +7,8 @@ This assistant helps answer student queries using scraped course content and Dis
 
 ## 🔗 Live Links
 
-- 🚀 **API Endpoint**: [https://tds-project-1-virtual-ta-two.vercel.app/query](https://tds-project-1-virtual-ta-two.vercel.app/query)  
-- 📂 **GitHub Repository**: [shivam91264/TDS-PROJECT-1-VIRTUAL-TA](https://github.com/shivam91264/TDS-PROJECT-1-VIRTUAL-TA)
-
+- 🚀 **API Endpoint**:   
+- 📂 **GitHub Repository**: 
 ---
 
 ## 📌 Problem Statement
