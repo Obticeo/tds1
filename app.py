@@ -1,5 +1,6 @@
 # app.py
 import os
+from datetime import datetime
 import json
 import sqlite3
 import numpy as np
@@ -23,11 +24,15 @@ logger = logging.getLogger(__name__)
 
 # Constants
 DB_PATH = "knowledge_base.db"
-SIMILARITY_THRESHOLD = 0.68  # Lowered threshold for better recall
-MAX_RESULTS = 10  # Increased to get more context
+SIMILARITY_THRESHOLD = 0.6  # Lowered threshold for better recall
+MAX_RESULTS = 12 # Increased to get more context
 load_dotenv()
-MAX_CONTEXT_CHUNKS = 4  # Increased number of chunks per source
+MAX_CONTEXT_CHUNKS = 6  # Increased number of chunks per source
 API_KEY = os.getenv("API_KEY")  # Get API key from environment variable
+
+# New constants
+MIN_SIMILARITY_THRESHOLD = 0.4
+MIN_REQUIRED_RESULTS = 3
 
 # Models
 class QueryRequest(BaseModel):
@@ -188,127 +193,115 @@ async def find_similar_content(query_embedding, conn):
         logger.info("Finding similar content in database")
         cursor = conn.cursor()
         results = []
+        current_threshold = SIMILARITY_THRESHOLD
         
-        # Search discourse chunks
-        logger.info("Querying discourse chunks")
-        cursor.execute("""
-        SELECT id, post_id, topic_id, topic_title, post_number, author, created_at, 
-               likes, chunk_index, content, url, embedding 
-        FROM discourse_chunks 
-        WHERE embedding IS NOT NULL
-        """)
-        
-        discourse_chunks = cursor.fetchall()
-        logger.info(f"Processing {len(discourse_chunks)} discourse chunks")
-        processed_count = 0
-        
-        for chunk in discourse_chunks:
-            try:
-                embedding = json.loads(chunk["embedding"])
-                similarity = cosine_similarity(query_embedding, embedding)
-                
-                if similarity >= SIMILARITY_THRESHOLD:
-                    # Ensure URL is properly formatted
-                    url = chunk["url"]
-                    if not url.startswith("http"):
-                        # Fix missing protocol
-                        url = f"https://discourse.onlinedegree.iitm.ac.in/t/{url}"
+        while current_threshold >= MIN_SIMILARITY_THRESHOLD and len(results) < MIN_REQUIRED_RESULTS:
+            results = []  # Reset results for new threshold
+            
+            # Process discourse chunks
+            cursor.execute("""
+            SELECT id, post_id, topic_id, topic_title, post_number, author, created_at, 
+                   likes, chunk_index, content, url, embedding 
+            FROM discourse_chunks 
+            WHERE embedding IS NOT NULL
+            """)
+            
+            discourse_chunks = cursor.fetchall()
+            
+            for chunk in discourse_chunks:
+                try:
+                    embedding = json.loads(chunk["embedding"])
+                    base_similarity = cosine_similarity(query_embedding, embedding)
                     
-                    results.append({
-                        "source": "discourse",
-                        "id": chunk["id"],
-                        "post_id": chunk["post_id"],
-                        "topic_id": chunk["topic_id"],
-                        "title": chunk["topic_title"],
-                        "url": url,
-                        "content": chunk["content"],
-                        "author": chunk["author"],
-                        "created_at": chunk["created_at"],
-                        "chunk_index": chunk["chunk_index"],
-                        "similarity": float(similarity)
-                    })
-                
-                processed_count += 1
-                if processed_count % 1000 == 0:
-                    logger.info(f"Processed {processed_count}/{len(discourse_chunks)} discourse chunks")
+                    if base_similarity >= current_threshold:
+                        # Apply recency boost
+                        date = datetime.fromisoformat(chunk["created_at"])
+                        days_old = (datetime.now() - date.replace(tzinfo=None)).days
+                        recency_boost = max(0, 1 - (days_old / 90))  # 90-day window
+                        
+                        # Calculate final similarity with weights
+                        final_similarity = base_similarity * (1 + recency_boost * 0.2)
+                        
+                        url = chunk["url"]
+                        if not url.startswith("http"):
+                            url = f"https://discourse.onlinedegree.iitm.ac.in/t/{url}"
+                        
+                        results.append({
+                            "source": "discourse",
+                            "id": chunk["id"],
+                            "post_id": chunk["post_id"],
+                            "topic_id": chunk["topic_id"],
+                            "title": chunk["topic_title"],
+                            "url": url,
+                            "content": chunk["content"],
+                            "author": chunk["author"],
+                            "created_at": chunk["created_at"],
+                            "chunk_index": chunk["chunk_index"],
+                            "similarity": float(final_similarity)
+                        })
+                        
+                except Exception as e:
+                    logger.error(f"Error processing discourse chunk {chunk['id']}: {e}")
+            
+            # Process markdown chunks
+            cursor.execute("""
+            SELECT id, doc_title, original_url, downloaded_at, chunk_index, content, embedding 
+            FROM markdown_chunks 
+            WHERE embedding IS NOT NULL
+            """)
+            
+            markdown_chunks = cursor.fetchall()
+            
+            for chunk in markdown_chunks:
+                try:
+                    embedding = json.loads(chunk["embedding"])
+                    base_similarity = cosine_similarity(query_embedding, embedding)
                     
-            except Exception as e:
-                logger.error(f"Error processing discourse chunk {chunk['id']}: {e}")
+                    if base_similarity >= current_threshold:
+                        # Apply documentation boost
+                        final_similarity = base_similarity * 1.1  # 10% boost for documentation
+                        
+                        url = chunk["original_url"]
+                        if not url or not url.startswith("http"):
+                            url = f"https://docs.onlinedegree.iitm.ac.in/{chunk['doc_title']}"
+                        
+                        results.append({
+                            "source": "markdown",
+                            "id": chunk["id"],
+                            "title": chunk["doc_title"],
+                            "url": url,
+                            "content": chunk["content"],
+                            "chunk_index": chunk["chunk_index"],
+                            "similarity": float(final_similarity)
+                        })
+                        
+                except Exception as e:
+                    logger.error(f"Error processing markdown chunk {chunk['id']}: {e}")
+            
+            if len(results) < MIN_REQUIRED_RESULTS:
+                current_threshold -= 0.1
+                logger.info(f"Lowering threshold to {current_threshold} to find more results")
+            else:
+                break
         
-        # Search markdown chunks
-        logger.info("Querying markdown chunks")
-        cursor.execute("""
-        SELECT id, doc_title, original_url, downloaded_at, chunk_index, content, embedding 
-        FROM markdown_chunks 
-        WHERE embedding IS NOT NULL
-        """)
-        
-        markdown_chunks = cursor.fetchall()
-        logger.info(f"Processing {len(markdown_chunks)} markdown chunks")
-        processed_count = 0
-        
-        for chunk in markdown_chunks:
-            try:
-                embedding = json.loads(chunk["embedding"])
-                similarity = cosine_similarity(query_embedding, embedding)
-                
-                if similarity >= SIMILARITY_THRESHOLD:
-                    # Ensure URL is properly formatted
-                    url = chunk["original_url"]
-                    if not url or not url.startswith("http"):
-                        # Use a default URL if missing
-                        url = f"https://docs.onlinedegree.iitm.ac.in/{chunk['doc_title']}"
-                    
-                    results.append({
-                        "source": "markdown",
-                        "id": chunk["id"],
-                        "title": chunk["doc_title"],
-                        "url": url,
-                        "content": chunk["content"],
-                        "chunk_index": chunk["chunk_index"],
-                        "similarity": float(similarity)
-                    })
-                
-                processed_count += 1
-                if processed_count % 1000 == 0:
-                    logger.info(f"Processed {processed_count}/{len(markdown_chunks)} markdown chunks")
-                    
-            except Exception as e:
-                logger.error(f"Error processing markdown chunk {chunk['id']}: {e}")
-        
-        # Sort by similarity (descending)
+        # Sort and group results as before
         results.sort(key=lambda x: x["similarity"], reverse=True)
-        logger.info(f"Found {len(results)} relevant results above threshold")
-        
-        # Group by source document and keep most relevant chunks
         grouped_results = {}
         
         for result in results:
-            # Create a unique key for the document/post
-            if result["source"] == "discourse":
-                key = f"discourse_{result['post_id']}"
-            else:
-                key = f"markdown_{result['title']}"
-            
+            key = f"{result['source']}_{result['post_id' if result['source'] == 'discourse' else 'title']}"
             if key not in grouped_results:
                 grouped_results[key] = []
-            
             grouped_results[key].append(result)
         
-        # For each source, keep only the most relevant chunks
         final_results = []
-        for key, chunks in grouped_results.items():
-            # Sort chunks by similarity
+        for chunks in grouped_results.values():
             chunks.sort(key=lambda x: x["similarity"], reverse=True)
-            # Keep top chunks
             final_results.extend(chunks[:MAX_CONTEXT_CHUNKS])
         
-        # Sort again by similarity
         final_results.sort(key=lambda x: x["similarity"], reverse=True)
-        
-        # Return top results, limited by MAX_RESULTS
-        logger.info(f"Returning {len(final_results[:MAX_RESULTS])} final results after grouping")
         return final_results[:MAX_RESULTS]
+        
     except Exception as e:
         error_msg = f"Error in find_similar_content: {e}"
         logger.error(error_msg)
@@ -725,4 +718,4 @@ async def health_check():
         )
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
